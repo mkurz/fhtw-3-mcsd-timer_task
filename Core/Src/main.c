@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : Timer Task, siehe Erklärung unten
   ******************************************************************************
   * @attention
   *
@@ -15,6 +15,23 @@
   *                        opensource.org/licenses/BSD-3-Clause
   *
   ******************************************************************************
+  *
+  *
+  * @ Erklärung für Herrn Kobelrausch:
+  *
+  * Die grüne LD3 blinkt gleichmaessig alle 4 Sekunden. Diese 4 Sekunden "delay"
+  * entstehen durch den Aufruf der blocking method.
+  * Immer nach dem auf- bzw. abdrehen der LD3 wird, parallel dazu, nach einer Sekunde die
+  * rote RGB LED vom dev-board auf oder abgedreht - dies jedoch durch den Aufruf der
+  * non-blocking method.
+  * Da die non-blocking Methode eben nicht blockiert, verzögert sich der 4 Sekunden Rhythmus
+  * der grünen ld3 NICHT (!) - es bleibt bei regelmaessigen 4 Sekunden - obwohl "parallel" dazu
+  * die rote LED getoggelt wird.
+  * Realisiert wird das Ganze mit einem globalen counter welcher in 50ms Schritten,
+  * ausgelöst durch den TIM6 timer + interrupt, aufwärts zählt.
+  *
+  *
+  *
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
@@ -43,7 +60,10 @@
 TIM_HandleTypeDef htim6;
 
 /* USER CODE BEGIN PV */
-
+unsigned int tim6_elapsed = 0; // Basically our global clock/counter; counts upwards in 50ms steps
+unsigned int non_blocking_called_at_time = 0; // saves the "time" of the moment when the non-blocking method was called
+unsigned int non_blocking_callback_timeout_ms = 0; // timeout after which the callback function passed to the non-blocking method should be called
+void (*non_blocking_callback)(void) = NULL; // callback function reference
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -51,6 +71,8 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM6_Init(void);
 /* USER CODE BEGIN PFP */
+void _tim_timeout_blocking(unsigned int);
+void _tim_timeout_nonblocking_with_callback(unsigned int, void (*callback)(void));
 void toggle_red_LED(void);
 /* USER CODE END PFP */
 
@@ -93,6 +115,9 @@ int main(void)
   // First, let's turn off the RED RGB LED
   HAL_GPIO_WritePin(RGB_LED_RED_GPIO_Port, RGB_LED_RED_Pin, GPIO_PIN_SET);
 
+  // Turn on green LD3
+  HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+
   // Start TIM6 with interrupt
   HAL_TIM_Base_Start_IT(&htim6);
 
@@ -102,6 +127,16 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    // First, we call the blocking method, which blocks for 4 seconds
+    _tim_timeout_blocking(4000);
+    // After 4 seconds, the green led (LD3) will be turned on or off
+    HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+    // Now we call the non-blocking method:
+    // It returns immediately, so the green LD3 keeps "blinking" every 4 seconds
+    // You will see that every time after 1 second after the green LD3 was turned off or on
+    // the red LED will be turned off or on
+    _tim_timeout_nonblocking_with_callback(1000, toggle_red_LED);
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -248,14 +283,69 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void toggle_red_LED() {
-  HAL_GPIO_TogglePin(RGB_LED_RED_GPIO_Port, RGB_LED_RED_Pin);
+
+/**
+  * @brief  Blocks execution for a given amount of time (in milliseconds).
+  * @param  timeout_milliseconds: Timeout in milliseconds for how long the method should block.
+  *         Should be 50ms steps (E.g. 750, 900 or, 1050, but not 749, 816,..)
+  * @retval None
+  */
+void _tim_timeout_blocking(unsigned int timeout_milliseconds) {
+  unsigned int current_tim6_elapsed = tim6_elapsed;
+  while (tim6_elapsed < current_tim6_elapsed + timeout_milliseconds) {
+    // Here we block until the given timeout elapsed (measured with our own "clock" tim6_elapsed ;)
+  }
 }
 
+/**
+  * @brief  Runs a callback method after a given timeout has passed, but does that async with the help of an interrupt,
+  *         and therefore does not block execution, which means it will return immediately.
+  * @param  timeout_milliseconds: Timeout in milliseconds after which the callback method should be run.
+  *         Should be 50ms steps (E.g. 750, 900 or, 1050, but not 749, 816,..)
+  * @param  callback: Method reference used as callback method that will be run after the timeout has passed.
+  * @retval None
+  */
+void _tim_timeout_nonblocking_with_callback(unsigned int timeout_milliseconds, void (*callback)(void)) {
+  // Here you can see no work is done (= no blocking)
+  // We just assign variables, which the interrupt routine will use by calling the callback method later
+  non_blocking_callback = callback;
+  non_blocking_callback_timeout_ms = timeout_milliseconds;
+  non_blocking_called_at_time = tim6_elapsed;
+}
+
+/**
+  * @brief  Turns on/off the red RDB led. Used as callback method for this task.
+  *         Also unsets the callback method.
+  * @retval None
+  */
+void toggle_red_LED() {
+  HAL_GPIO_TogglePin(RGB_LED_RED_GPIO_Port, RGB_LED_RED_Pin);
+
+  // After the red LED was toggled, let's reset the callback as proof that next time the non-blocking function
+  // get's called the callback function will be set (again)
+  non_blocking_callback = NULL;
+  non_blocking_callback_timeout_ms = 0;
+  non_blocking_called_at_time = 0;
+}
+
+/**
+  * @brief  Interrupt routine which gets fired by timers.
+  *         For our task we use it to increase our custom (global) counter and to call the callback method set by the
+  *         non-blocking method.
+  * @param  htim: Information about the timer.
+  * @retval None
+  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-  HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
-  toggle_red_LED();
+  // Here the magic happens with our custom clock (which just is a counter)
+  // Because we have 32MHZ and use a pre-scaler of 32000 that mans our clock speed is 1ms
+  // However because I set the period to 49 the interrupt fires every 50ms and the counter therefore increased in 50ms steps
+  tim6_elapsed += htim->Instance -> ARR + 1; // 49 + 1 = 50 ms to add to the counter
+
+  if (non_blocking_callback != NULL && tim6_elapsed >= non_blocking_called_at_time + non_blocking_callback_timeout_ms) {
+    // If a non-blocking callback is currently set and if its time to call it, call it ;)
+    non_blocking_callback();
+  }
 }
 /* USER CODE END 4 */
 
